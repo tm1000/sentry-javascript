@@ -1,7 +1,7 @@
 import { captureException, flush, getCurrentHub, Handlers, startTransaction, withScope } from '@sentry/node';
 import { extractTraceparentData, getActiveTransaction, hasTracingEnabled } from '@sentry/tracing';
 import { addExceptionMechanism, isString, logger, stripUrlQueryAndFragment } from '@sentry/utils';
-import { NextApiHandler } from 'next';
+import { NextApiHandler, NextApiResponse } from 'next';
 
 import { addRequestDataToEvent, NextRequest } from './instrumentServer';
 
@@ -51,6 +51,8 @@ export const withSentry = (handler: NextApiHandler): WrappedNextApiHandler => {
             { request: req },
           );
           currentScope.setSpan(transaction);
+
+          res.on('finish', async () => await finishTransaction(res));
         }
       }
 
@@ -65,19 +67,44 @@ export const withSentry = (handler: NextApiHandler): WrappedNextApiHandler => {
         });
         captureException(e);
       });
+      await finishTransaction(res);
       throw e;
-    } finally {
-      const transaction = getActiveTransaction();
-      if (transaction) {
-        transaction.setHttpStatus(res.statusCode);
-
-        transaction.finish();
-      }
-      try {
-        await flush(2000);
-      } catch (e) {
-        // no-empty
-      }
     }
   };
 };
+
+async function finishTransaction(res: NextApiResponse): Promise<void> {
+  const transaction = getActiveTransaction();
+
+  if (!transaction) {
+    // nothing to do
+    return Promise.resolve();
+  }
+
+  // now that we have the transaction, pop it off of the scope so it doesn't affect future requests
+  // TODO use domains?
+  getCurrentHub()
+    .getScope()
+    ?.setSpan(undefined);
+
+  transaction.setHttpStatus(res.statusCode);
+
+  const finishPromise = new Promise<void>((resolve, reject) => {
+    // Push `transaction.finish` to the next event loop so open spans have a chance to finish before the
+    // transaction closes
+    setImmediate(async () => {
+      transaction.finish();
+      try {
+        logger.log('Flushing event buffer');
+        await flush(2000);
+        logger.log('Buffer flushed');
+        resolve();
+      } catch (err) {
+        logger.log('Error while flushing buffer:', err);
+        reject(err);
+      }
+    });
+  });
+
+  return finishPromise;
+}
